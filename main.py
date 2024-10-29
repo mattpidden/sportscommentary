@@ -1,11 +1,18 @@
 import requests
 from bs4 import BeautifulSoup
 import time
-import io
-import pyttsx3
+import os
+from openai import OpenAI
+from pathlib import Path
+from pydub import AudioSegment
+from pydub.playback import play
+from dotenv import load_dotenv
+import pygame
 
-# Load a pre-trained text generation model
-#generator = pipeline('text-generation', model='gpt2')  # You can choose a different model if needed
+
+load_dotenv()
+
+client = OpenAI(api_key = os.getenv('OPENAI_API_KEY'))
 
 # Function to scrape Live Text section
 def scrape_live_text(soup):
@@ -14,12 +21,16 @@ def scrape_live_text(soup):
     if live_text_section:
         for li in live_text_section.find_all('li'):
             timestamp_span = li.find('span', {'data-testid': 'accessible-timestamp'})
+            title_span = li.find('span', {'role': 'text'})
             p_tag = li.find('p')
             
             if timestamp_span and p_tag:
                 timestamp = timestamp_span.get_text(strip=True)
+                title = title_span.find('span', recursive=False).get_text(strip=True) if title_span else None
+                if title == "Post":
+                    title = None
                 text = p_tag.get_text(strip=True)
-                live_text.append(f"{timestamp} - {text}")
+                live_text.append(f"{timestamp} - {title if title != None else ""} {text}")
     return live_text
 
 # Function to scrape Match Report section
@@ -31,10 +42,43 @@ def scrape_match_report(soup):
 
 # Function to scrape Scores section
 def scrape_scores(soup):
-    scores_section = soup.find(id='Scores')
-    if scores_section:
-        for p in scores_section.find_all('p'):
-            print(p.get_text(strip=True))
+    hometeam = ""
+    awayteam = ""
+    hometeamscore = 0
+    awayteamscore = 0
+    venue = ""
+    # Scrape header info for team names and stadium
+    header_info = soup.find(id='live-header-aside-content')
+    if header_info:
+        # Extract home team name
+        home_team = header_info.find("div", class_=lambda x: x and 'TeamHome' in x)
+        if home_team:
+            home_team_name = home_team.find("span", class_=lambda x: x and 'DesktopValue' in x)
+            if home_team_name:
+                hometeam = home_team_name.get_text(strip=True)
+        
+        # Extract away team name from span with class containing 'DesktopValue'
+        away_team = header_info.find("div", class_=lambda x: x and 'TeamAway' in x)
+        if away_team:
+            away_team_name = away_team.find("span", class_=lambda x: x and 'DesktopValue' in x)
+            if away_team_name:
+                awayteam = away_team_name.get_text(strip=True)
+        
+        # Extract stadium name
+        stadium = header_info.find("div", class_=lambda x: x and 'Venue' in x)
+        if stadium:
+            venue = stadium.get_text(strip=True)
+
+        
+        # Extract stadium name
+        home_score = header_info.find("div", class_=lambda x: x and 'HomeScore' in x)
+        away_score = header_info.find("div", class_=lambda x: x and 'AwayScore' in x)
+
+        if home_score:
+            hometeamscore = home_score.get_text(strip=True)
+        if away_score:
+            awayteamscore = away_score.get_text(strip=True)
+    return hometeam, awayteam, hometeamscore, awayteamscore, venue
 
 # Function to scrape Line-ups section
 def scrape_lineups(soup):
@@ -68,19 +112,33 @@ def fetch_and_parse(base_url):
         print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
         return None
 
-def speak_text(text):
-    engine = pyttsx3.init()
+def speak_text(text, hometeam, awayteam, hometeamscore, awayteamscore, venue):
+    # Generate commentary text
+    completion = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": f"You are a english football (soccer) radio commentator. use the data provided to say something like a commentator. (Match details: home team = {hometeam}, away team = {awayteam}, home team score = {hometeamscore}, away team score = {awayteamscore}, {venue})"},
+            {"role": "user", "content": text}
+        ]
+    )
+    commentary = completion.choices[0].message.content
+    print(commentary)
 
-    # Adjust speech rate (default is around 200, lower it to make it slower)
-    rate = engine.getProperty('rate')
-    engine.setProperty('rate', rate - 40)
+    # Set file path for audio
+    speech_file_path = Path(__file__).parent / "speech.mp3"
 
-    # Change voice (you can change the index for different voices)
-    #//voices = engine.getProperty('voices')
-    #engine.setProperty('voice', voices[0].id)  # Try voices[1] or others for different pitch
+    # Generate audio
+    response = client.audio.speech.create(
+        model="tts-1",
+        voice="onyx",
+        input=commentary,
+    ) 
 
-    engine.say(text)
-    engine.runAndWait()
+    response.stream_to_file(speech_file_path)
+
+    # Load and play the audio file
+    audio = AudioSegment.from_mp3(speech_file_path)
+    play(audio)
 
 
 def generate_commentary(live_text):
@@ -89,13 +147,22 @@ def generate_commentary(live_text):
     #commentary = response[0]['generated_text']
     return live_text
 
+# Function to play background music
+def play_music():
+    pygame.mixer.init()
+    pygame.mixer.music.load('background_crowd.mp3')  # Replace with your MP3 file path
+    pygame.mixer.music.set_volume(0.1)  # Optional volume adjustment
+    pygame.mixer.music.play(-1)  # Play indefinitely
+
 # Main function to scrape and print content
 def main():
-    base_url = "https://www.bbc.co.uk/sport/football/live/czj9v2dpd11t"
+    play_music()
+
+    base_url = "https://www.bbc.co.uk/sport/football/live/crln8pjzjxet"
     
     processed_entries = set()  # Store processed entries here
     
-    # Loop to rescrape every minute
+    # Loop to rescrape indefinetly
     while True:
         print("\n--- Starting new scrape cycle ---")
         
@@ -103,17 +170,19 @@ def main():
         
         if soup:
             print("Soup successfully fetched.")
+            hometeam, awayteam, hometeamscore, awayteamscore, venue = scrape_scores(soup)
             live_text = scrape_live_text(soup)
+            live_text = live_text[:5]
             print(f"Live text entries scraped: {len(live_text)}")
 
             # Filter out entries that have already been processed
             new_entries = [entry for entry in live_text if entry not in processed_entries]
+            
             print(f"New entries to process: {len(new_entries)}")
 
             if new_entries:
                 for entry in new_entries[::-1]:  # Reverse to process newest first
-                    print(f"Processing new live text entry: {entry}")
-                    speak_text(entry)
+                    speak_text(entry, hometeam, awayteam, hometeamscore, awayteamscore, venue)
 
                 # Add new entries to the processed set
                 processed_entries.update(new_entries)
